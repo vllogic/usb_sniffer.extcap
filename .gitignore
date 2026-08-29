@@ -1,0 +1,6 @@
+capture_usb_vllogic
+capture_usb_vllogic.exe
+test/
+*.o
+*.bin
+*.pcapng
