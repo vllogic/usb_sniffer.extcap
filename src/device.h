@@ -22,9 +22,12 @@
 typedef enum
 {
   Device_None = 0,
-  Device_Gen1,      // ataradov-class sniffer only
-  Device_Gen2,      // USB Sniffer 2 only
-  Device_Both,      // both generations are on the bus
+  Device_Gen1,        // ataradov-class sniffer only
+  Device_Gen2,        // USB Sniffer 2 only
+  Device_Both,        // both generations are on the bus
+  Device_Fx2lp_Only,  // only an unconfigured FX2LP (04b4:8613) is on the bus;
+                      // it belongs to the gen1 family but carries no capture
+                      // firmware, so it may well be an unrelated FX2LP device
 } device_kind;
 
 device_kind device_probe(void);

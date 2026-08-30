@@ -77,8 +77,19 @@ static int os_opt_parse(const OsOption *options, int argc, char *argv[])
       const OsOption *opt = find_long_option(options, &arg[2]);
       os_check(opt, "unrecognized option: %s", arg);
 
+      // An inline "=value" is only meaningful for options that take an
+      // argument.  Boolean options must never be written through a char**
+      // cast: g_opt.extcap_version is a bool, and Wireshark >= 4.6 invokes
+      // "--extcap-interfaces --extcap-version=<major.minor>", so the pointer
+      // store would scribble over the adjacent bool fields of Options and
+      // randomly drop the interface listing.  Tolerate and ignore the value.
       if (value)
-        *(char **)opt->value = &value[1];
+      {
+        if (opt->arg_name)
+          *(char **)opt->value = &value[1];
+        else
+          *(bool *)opt->value = true;
+      }
       else if (opt->arg_name)
         arg_opt = opt;
       else
@@ -276,7 +287,15 @@ bool handle_extcap_request(void)
 
   if (g_opt.extcap_dlts)
   {
-    printf("dlt {number=%d}{name=USB}{display=USB}\n", LINKTYPE_USB_2_0);
+    // The IDB actually written depends on the bus speed chosen at capture
+    // time (dlt_for_speed(): 293/294/295, or 288 before speed detection),
+    // so all four USB link types are advertised here.  Wireshark matches the
+    // interface against the IDB found in the pcapng stream when the capture
+    // starts.
+    printf("dlt {number=%d}{name=USB_2_0}{display=USB 2.0}\n", LINKTYPE_USB_2_0);
+    printf("dlt {number=%d}{name=USB_2_0_LOW_SPEED}{display=USB 2.0 Low Speed}\n", LINKTYPE_USB_2_0_LOW_SPEED);
+    printf("dlt {number=%d}{name=USB_2_0_FULL_SPEED}{display=USB 2.0 Full Speed}\n", LINKTYPE_USB_2_0_FULL_SPEED);
+    printf("dlt {number=%d}{name=USB_2_0_HIGH_SPEED}{display=USB 2.0 High Speed}\n", LINKTYPE_USB_2_0_HIGH_SPEED);
     return true;
   }
 

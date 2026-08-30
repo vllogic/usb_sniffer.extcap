@@ -37,7 +37,7 @@ static bool gen1_classify(int vid, int pid, int bcd)
 device_kind device_probe(void)
 {
   libusb_device **devices = NULL;
-  bool gen1 = false, gen2 = false;
+  bool gen1 = false, gen2 = false, fx2lp = false;
   int rc = libusb_init(NULL);
 
   if (rc < 0)
@@ -58,7 +58,10 @@ device_kind device_probe(void)
       gen1 = true;
 
     if (desc.idVendor == USB_VID_FX2LP && desc.idProduct == USB_PID_FX2LP)
-      gen1 = true;   // unconfigured FX2LP still belongs to the gen1 family
+      fx2lp = true;   // unconfigured FX2LP bootstrap: gen1 family, but not a
+                      // capture device until the firmware is loaded; 04b4:8613
+                      // is the default descriptor of every FX2LP, so a board
+                      // unrelated to this project matches it too
 
     if (device_is_gen2(desc.idVendor, desc.idProduct, desc.bcdDevice))
       gen2 = true;
@@ -73,8 +76,10 @@ device_kind device_probe(void)
   if (gen1 && gen2)
     return Device_Both;
   if (gen1)
-    return Device_Gen1;
+    return Device_Gen1;   // a configured gen1 outranks a bare FX2LP
   if (gen2)
-    return Device_Gen2;
+    return Device_Gen2;   // an unrelated FX2LP on the bus must not block gen2
+  if (fx2lp)
+    return Device_Fx2lp_Only;
   return Device_None;
 }

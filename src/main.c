@@ -351,6 +351,11 @@ static void missing_device_error(device_kind probe)
 {
   if (probe == Device_None)
     os_error("no capture device found (gen1 1209:6688 rev 0x0001 / 6666:6620, gen2 1209:6688 rev 0x0602)");
+  if (probe == Device_Fx2lp_Only)
+    os_error("only an unconfigured FX2LP (04b4:8613) was found: if this is the gen1 sniffer, "
+             "load the firmware first ('--mcu-sram usb_sniffer.bin' to run, or '--mcu-eeprom' "
+             "to program it permanently); if it is a different FX2LP device, it is not a "
+             "capture device and must be unplugged");
   if (probe == Device_Both)
     os_error("both capture generations are connected; unplug one of them");
 }

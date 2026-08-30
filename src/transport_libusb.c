@@ -403,6 +403,18 @@ static void tl_close(transport *t)
 
     p->closing = true;   // in_callback() must not resubmit during teardown
 
+    // OUT pool: a command issued right before teardown may still be in
+    // flight.  libusb requires cancellation before free; the shared drain
+    // loop below lets out_callback() run and release the slot.  Cancel
+    // errors are ignored: after the session-end reset above the device may
+    // already be re-enumerating (NOT_FOUND / NO_DEVICE), in which case the
+    // transfer is either already complete or gone with the bus.
+    for (int i = 0; i < OUT_POOL_SIZE; i++)
+    {
+      if (p->out_pool[i].transfer && p->out_pool[i].busy)
+        libusb_cancel_transfer(p->out_pool[i].transfer);
+    }
+
     for (int i = 0; i < TRANSFER_COUNT; i++)
     {
       if (p->in_transfers[i])

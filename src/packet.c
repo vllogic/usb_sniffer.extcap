@@ -109,6 +109,15 @@ static void capture_info(packet *p, u64 ts, const char *fmt, ...)
   int len = vsnprintf(str, sizeof(str), fmt, args);
   va_end(args);
 
+  // vsnprintf() returns the *untruncated* would-be length: passing it on
+  // unclamped after a truncation would make pcapng_write_info() read past
+  // str[] and blow past the pcapng block assembly buffer.  All current
+  // messages fit comfortably, but keep it safe by construction.
+  if (len < 0)
+    len = 0;
+  else if (len > (int)sizeof(str) - 1)
+    len = (int)sizeof(str) - 1;
+
   line_state_event(p);
   stop_folding(p);
 
@@ -420,9 +429,14 @@ static void desync_error(packet *p)
   // must survive those events.
   capture_info(p, p->capture_ts, "Error: frame desynchronization, resynchronizing");
 
+  // Hex-dump at most 84 bytes: 3 chars each ("xx ") plus NUL must stay
+  // within header[].  Call sites currently run in the header phase with
+  // capture_size of 4 or 7, but the bound keeps the strcat safe if this is
+  // ever reached with a payload-sized buffer.
   char header[256] = {0};
+  int dump = os_min(p->capture_size, (int)(sizeof(header) - 4) / 3);
 
-  for (int i = 0; i < p->capture_size; i++)
+  for (int i = 0; i < dump; i++)
   {
     char tmp[16];
     snprintf(tmp, sizeof(tmp), "%02x ", p->capture_data[i]);

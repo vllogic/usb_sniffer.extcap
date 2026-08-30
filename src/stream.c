@@ -283,13 +283,15 @@ void stream_feed(stream *s, const u8 *data, int size)
 
     process_available(s);
 
-    if (s->len > SCAN_KEEP_TAIL)
-    {
-      int keep = os_min(s->len, SCAN_KEEP_TAIL);
-      memmove(s->buf, &s->buf[s->len - keep], (size_t)keep);
-      s->len = keep;
-      s->head = 0;
-    }
+    // Make room for the remainder without losing pending bytes.  After
+    // process_available() the buffer can hold an incomplete but valid block
+    // (up to ~16 KiB) in STREAM_BLOCK state, or a held header candidate in
+    // STREAM_SCAN.  The previous "keep only the last 3 bytes" drop destroyed
+    // both: under sustained traffic (TRANSFER_SIZE == staging size) every
+    // buffer-full event lost a whole in-progress block and forced a spurious
+    // resync + "USB link packet loss" report.  Compaction moves at most one
+    // maximum-size block (~16 KiB) to the front and preserves everything.
+    compact(s);
   }
 
   process_available(s);

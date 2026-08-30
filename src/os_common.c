@@ -129,7 +129,9 @@ u8 *find_str(u8 *buf, int size, char *str)
   if (size == 0 || len == 0 || size < len)
     return NULL;
 
-  for (int i = 0; i < (size - len); i++)
+  // The last valid start offset is size - len (match ends exactly at the
+  // buffer end), hence "<="; the previous "<" silently missed that case.
+  for (int i = 0; i <= (size - len); i++)
   {
     if (memcmp(buf + i, str, (size_t)len) == 0)
       return buf + i;
