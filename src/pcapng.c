@@ -155,6 +155,12 @@ pcapng *pcapng_open(const char *path)
   p->fd = fopen(path, "wb");
   os_check(p->fd, "could not open FIFO pipe '%s'", path);
 
+  // Buffered file IO: EPBs accumulate here (glibc allocates the buffer) and
+  // hit the disk/pipe in large bursts instead of one fwrite() syscall per
+  // frame.  capture_info() still calls pcapng_flush() on events, so the pipe
+  // stays live for Wireshark.
+  setvbuf(p->fd, NULL, _IOFBF, 1 << 20);
+
   return p;
 }
 

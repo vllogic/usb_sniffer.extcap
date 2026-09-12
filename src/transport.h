@@ -37,6 +37,10 @@ typedef struct
   int  (*write)(transport *t, const u8 *data, int size);
   bool (*alive)(const transport *t);
   void (*close)(transport *t);
+  // Optional uplink bandwidth probe: keep reading the upstream endpoint for
+  // window_ms (with an internal async pool, bypassing the feed callback) and
+  // return the number of bytes received, or -1 when not supported (replay).
+  s64  (*probe_upstream)(transport *t, long window_ms);
 } transport_ops;
 
 // libusb: open/claim the device (VID 0x1209 / PID 0x6688).  The EP1 IN async
@@ -70,6 +74,12 @@ int transport_write(transport *t, const u8 *data, int size);
 
 // True while the transport can still produce or consume data.
 bool transport_alive(const transport *t);
+
+// Measure uplink throughput: reads the upstream endpoint with an internal
+// async pool for window_ms and returns the number of bytes received.
+// Returns -1 when the transport does not support probing (replay backend):
+// callers must skip the probe and the bandwidth announcement in that case.
+s64 transport_probe_upstream(transport *t, long window_ms);
 
 void transport_close(transport *t);
 

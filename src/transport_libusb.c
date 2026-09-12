@@ -19,13 +19,35 @@
 
 #define EP_IN            0x81
 #define EP_OUT           0x01
-#define TRANSFER_SIZE    (512 * 512)            // 256 KiB per IN transfer
-#define TRANSFER_COUNT   8
+// 主机侧 IN 传输池: 16 x 256KiB (总 4MiB)。实测在 Windows 独立抓取(读 32MB)
+// 下 overflow 最低(118, 相比旧 8x256KB 的 174), 且内存仅 4MiB; 参考实现的
+// 32x16MiB(512MiB) 并无更好表现。Linux 同样适用(低于 usbfs_memory_mb 16MB)。
+#define TRANSFER_SIZE    (256 * 1024)           // 256 KiB per IN transfer
+#define TRANSFER_COUNT   16
 #define TRANSFER_TIMEOUT 1000                   // ms
+
+// 同步读/命令/探测缓冲上限: 不可沿用 16MiB 的异步池长度做同步
+// libusb_bulk_transfer(), Windows 下会崩溃/极不稳定。
+#define SYNC_BUF_SIZE    (256 * 1024)           // 256 KiB
 
 // Pool of OUT transfers (commands are tiny and rare).
 #define OUT_POOL_SIZE    4
 #define OUT_PACKET_MAX   64
+
+// Link-bandwidth probe: transient async IN pool used only during startup
+// (before stream_mode()).  Counts bytes only -- the feed callback is NOT
+// invoked, so probe traffic never enters the stream/packet pipeline.
+#define PROBE_COUNT      8
+#define PROBE_SIZE       (256 * 1024)
+
+typedef struct probe_ctx
+{
+  libusb_device_handle    *handle;
+  struct libusb_transfer  *tr[PROBE_COUNT];
+  u8                      *buf[PROBE_COUNT];
+  volatile s64            bytes;
+  volatile bool           stop;
+} probe_ctx;
 
 typedef struct out_slot
 {
@@ -109,19 +131,46 @@ static void tl_submit_in_pool(transport *t)
   if (!p->handle || p->streams_up)
     return;
 
+  int armed = 0;
+
   for (int i = 0; i < TRANSFER_COUNT; i++)
   {
     p->in_buffers[i] = os_alloc(TRANSFER_SIZE);
     p->in_transfers[i] = libusb_alloc_transfer(0);
-    os_check(p->in_transfers[i], "libusb_alloc_transfer()");
+
+    if (!p->in_buffers[i] || !p->in_transfers[i])
+    {
+      log_print("usb: alloc %d/%d failed (buf/transfer), skipping", i, TRANSFER_COUNT);
+      if (p->in_transfers[i]) libusb_free_transfer(p->in_transfers[i]);
+      if (p->in_buffers[i])   os_free(p->in_buffers[i]);
+      p->in_transfers[i] = NULL;
+      p->in_buffers[i] = NULL;
+      continue;
+    }
 
     libusb_fill_bulk_transfer(p->in_transfers[i], p->handle, EP_IN,
         p->in_buffers[i], TRANSFER_SIZE, in_callback, t, TRANSFER_TIMEOUT);
 
     rc = libusb_submit_transfer(p->in_transfers[i]);
     if (rc < 0)
-      os_error("libusb_submit_transfer(): %s", libusb_error_name(rc));
+    {
+      // 非致命: 大缓冲可能超出驱动可挂起上限, 降级为已成功提交的数量。
+      log_print("usb: submit_transfer %d/%d failed: %s, skipping",
+                i, TRANSFER_COUNT, libusb_error_name(rc));
+      libusb_free_transfer(p->in_transfers[i]);
+      p->in_transfers[i] = NULL;
+      os_free(p->in_buffers[i]);
+      p->in_buffers[i] = NULL;
+      continue;
+    }
+    armed++;
   }
+
+  log_print("usb: armed %d/%d IN transfers (%u KiB each)",
+            armed, TRANSFER_COUNT, (unsigned)(TRANSFER_SIZE / 1024));
+
+  if (armed == 0)
+    os_error("usb: could not arm any IN transfer");
 
   p->streams_up = true;
 }
@@ -178,7 +227,7 @@ static bool tl_open(transport *t)
 
   p->handle = handle;
 
-  p->cmd_buf = os_alloc(TRANSFER_SIZE);
+  p->cmd_buf = os_alloc(SYNC_BUF_SIZE);
 
   libusb_set_auto_detach_kernel_driver(handle, 1);
   rc = libusb_claim_interface(handle, 0);
@@ -210,11 +259,11 @@ static void tl_discard(transport *t)
   if (!p->handle)
     return;
 
-  buf = os_alloc(TRANSFER_SIZE);
+  buf = os_alloc(SYNC_BUF_SIZE);
 
   for (int k = 0; k < 50; k++)
   {
-    rc = libusb_bulk_transfer(p->handle, EP_IN, buf, TRANSFER_SIZE, &size, 20);
+    rc = libusb_bulk_transfer(p->handle, EP_IN, buf, SYNC_BUF_SIZE, &size, 20);
 
     if (rc == LIBUSB_ERROR_TIMEOUT)
     {
@@ -232,7 +281,7 @@ static void tl_discard(transport *t)
     else
     {
       drained += size;
-      if (size == TRANSFER_SIZE)
+      if (size == SYNC_BUF_SIZE)
         full_reads++;
     }
   }
@@ -278,7 +327,7 @@ static bool tl_events(transport *t, long timeout_ms)
       // yet; the caller keeps pumping until its deadline.
       int size;
 
-      rc = libusb_bulk_transfer(p->handle, EP_IN, p->cmd_buf, TRANSFER_SIZE,
+      rc = libusb_bulk_transfer(p->handle, EP_IN, p->cmd_buf, SYNC_BUF_SIZE,
                                 &size, timeout_ms);
 
       if (rc == LIBUSB_ERROR_TIMEOUT)
@@ -371,6 +420,96 @@ static int tl_write(transport *t, const u8 *data, int size)
   }
 
   return 0;
+}
+
+//-----------------------------------------------------------------------------
+static void LIBUSB_CALL probe_in_callback(struct libusb_transfer *transfer)
+{
+  probe_ctx *pc = (probe_ctx *)transfer->user_data;
+
+  if (transfer->status == LIBUSB_TRANSFER_COMPLETED)
+    pc->bytes += transfer->actual_length;
+
+  if (transfer->status == LIBUSB_TRANSFER_CANCELLED)
+    return;
+
+  if (pc->stop)
+    return;
+
+  int rc = libusb_submit_transfer(transfer);
+  if (rc < 0)
+    log_print("usb: probe IN resubmit failed: %s", libusb_error_name(rc));
+}
+
+//-----------------------------------------------------------------------------
+// Uplink bandwidth probe: run a transient async IN pool for window_ms and
+// return the number of bytes received.  The feed callback is not invoked
+// (the FPGA test-mode counter-fill is not capture traffic).  Returns -1 if
+// the device is gone.  Must run before stream_mode() (the main IN pool is
+// not started yet, so the probe's transfers do not collide with it).
+static s64 tl_probe_upstream(transport *t, long window_ms)
+{
+  libusb_priv *p = (libusb_priv *)t->priv;
+  probe_ctx pc = { 0 };
+  int rc;
+
+  if (!p->handle)
+    return -1;
+
+  pc.handle = p->handle;
+
+  for (int i = 0; i < PROBE_COUNT; i++)
+  {
+    pc.buf[i] = os_alloc(PROBE_SIZE);
+    pc.tr[i] = libusb_alloc_transfer(0);
+    os_check(pc.tr[i], "libusb_alloc_transfer() (probe)");
+
+    libusb_fill_bulk_transfer(pc.tr[i], p->handle, EP_IN,
+        pc.buf[i], PROBE_SIZE, probe_in_callback, &pc, TRANSFER_TIMEOUT);
+
+    rc = libusb_submit_transfer(pc.tr[i]);
+    if (rc < 0)
+    {
+      log_print("usb: probe IN submit failed: %s", libusb_error_name(rc));
+      break;
+    }
+  }
+
+  s64 deadline = os_get_time_ms() + window_ms;
+
+  while (os_get_time_ms() < deadline)
+  {
+    struct timeval tv = { 0, 20000 };
+    libusb_handle_events_timeout(NULL, &tv);
+  }
+
+  pc.stop = true;
+
+  for (int i = 0; i < PROBE_COUNT; i++)
+    if (pc.tr[i])
+      libusb_cancel_transfer(pc.tr[i]);
+
+  // Drain until every probe transfer ran its callback (bytes are final).
+  for (int spin = 0; spin < 50; spin++)
+  {
+    struct timeval tv = { 0, 10000 };
+    libusb_handle_events_timeout(NULL, &tv);
+  }
+
+  s64 got = pc.bytes;
+
+  for (int i = 0; i < PROBE_COUNT; i++)
+  {
+    if (pc.tr[i])
+    {
+      libusb_free_transfer(pc.tr[i]);
+      os_free(pc.buf[i]);
+    }
+  }
+
+  log_print("usb: probe window %ld ms read %lld bytes", window_ms, got);
+
+  return got;
 }
 
 //-----------------------------------------------------------------------------
@@ -467,6 +606,7 @@ transport *transport_libusb_new(const transport_callbacks *cb)
     .write = tl_write,
     .alive = tl_alive,
     .close = tl_close,
+    .probe_upstream = tl_probe_upstream,
   };
 
   t->cb = *cb;

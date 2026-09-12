@@ -112,8 +112,16 @@ make test SAMPLE_DIR=/path/to/ref.ataradov.usb-sniffer/doc
   usb3.ch32h417/Host/IAP/tools/iap_cli.py reset` 再试。
 - gen2 固件需配合正确版本 FPGA 码流（`gens/h7p20.builtin-4c22c79.lr4.bin`），
   旧码流（`9b55e8a.lr4.bin`）会使 UHSIF 命令面无 ACK。
+- gen2 在 USB2 母口下同样工作（2.0 落地态固件走 USBHS 数据面，EP1 直连
+  UHSIF，仅速率上限受 USB2 HS bulk 约束）。
 - gen1 未配置时是 FX2LP 默认引导设备（04b4:8613），用 `--mcu-sram` 直载
   固件即可运行；`--mcu-eeprom` 则永久写入。
+
+## 文档
+
+- [`docs/protocol.md`](docs/protocol.md)：UHSIF 字节级协议定义（命令面 / 上下行块格式）。
+- [`docs/uhsif_interface.md`](docs/uhsif_interface.md)：UHSIF 接口技术说明、使用限制与
+  性能测试使用指南（含真机基线数据与工具用法）。
 
 ## 源码结构
 

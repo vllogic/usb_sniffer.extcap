@@ -123,6 +123,15 @@ static bool tr_alive(const transport *t)
 }
 
 //-----------------------------------------------------------------------------
+static s64 tr_probe_upstream(transport *t, long window_ms)
+{
+  // Offline replay has no live link to measure; the caller skips the probe.
+  (void)t;
+  (void)window_ms;
+  return -1;
+}
+
+//-----------------------------------------------------------------------------
 static void tr_close(transport *t)
 {
   replay_priv *p = (replay_priv *)t->priv;
@@ -146,6 +155,7 @@ transport *transport_replay_new(const transport_callbacks *cb, const char *path)
     .write = tr_write,
     .alive = tr_alive,
     .close = tr_close,
+    .probe_upstream = tr_probe_upstream,
   };
   replay_priv *p = os_alloc(sizeof(replay_priv));
 

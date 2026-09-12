@@ -9,6 +9,10 @@ FPGA（H7P20）之间链路的**字节级协议定义**，以 FPGA 侧实现
 > CRC-16/CCITT-FALSE，命令魔数 `0x5AA5` → `0xC7F3`（块魔数 `0x6CC6` 不变），
 > 布局 `{crc16, magic}` 与 v2.1 相同。**上位机代码（`cmd.c` 打包、
 > `stream.c` 解析）需按本文档 v2.2 同步调整，本版为 FPGA 侧已经实现的定稿。**
+> **v2.3（2026-09-10，真机验证通过）**：新增下行批量通道（§2A）、
+> `0x22/0x23` 调试命令，上行块头 `VER` 2→3；命令面与上行块格式**完全不变**。
+> 2026-09-11 补充：批量块长度范围放开为 **16..16368 字节**（原 8192 下限取消），
+> 约束为"一个块 = 一次主机写入（AE# 收尾）"；16B..16KB 回环逐字校验已全 PASS。
 
 ## 1. 传输拓扑
 
@@ -18,13 +22,22 @@ PC ◀──EP1 IN(4+N words 块)── CH32H417(DMA 透传) ◀──UHSIF L0�
 ```
 
 - 设备为 vendor class，端点 EP1 IN(0x81) / EP1 OUT(0x01)；USB3 SuperSpeed 下为
-  bulk 1024B×burst 15；USB2 HS 512B 仅 fallback（当前固件 fallback 数据面未接
-  UHSIF，实际链路走 SuperSpeed）。
+  bulk 1024B×burst 15；USB2 HS 512B 逐包泵同样直连 UHSIF（固件 `usb_data_path`
+  在 2.0 落地态切到 USBHS，EP1 IN 由固件按 512B 分片消费 line0，EP1 OUT 直通
+  line1 命令面；链路速率上限按 USB2 HS bulk 而定）。
 - 固件（CH32）对上/下行内容零语义整包透传，无封装、无校验、无改动。
 - UHSIF 接口时钟实测口径 118 MHz（PLL `pll_fixed.v` 实际输出，顶层注释
   118.18 MHz），非标称 125 MHz；10 ms 短块超时计数按 125 M 配置，实际约 10.6 ms。
 - 字节序：**全 little-endian**。UHSIF 32-bit word 的低字节 = 先到达 USB 的字节。
 - VID/PID：`0x1209 / 0x6688`（固件 `usb_desc.h` 与 udev 规则同步）。
+- **主机侧强制要求（第三方上位机必读）**：打开设备后先 `libusb_get_configuration()`，
+  已配置（=1）时**不得**再调用 `libusb_set_configuration()`/SET_CONFIGURATION。
+  Linux 内核对"已配置设备"的重复 `USBDEVFS_SETCONFIGURATION` 会先执行
+  `usb_disable_device(dev, 1)`，而本设备为无内核驱动的 vendor 接口，xHCI 端点不会
+  被重建，导致其后 EP1 bulk 传输永久 `LIBUSB_ERROR_IO`（须设备复位/重枚举恢复）。
+  设备固件本身对 wire 级 SET_CONFIGURATION 处理正常，问题在主机 usbfs/内核路径；
+  各参考工具已按此规则实现（F1a），复现/验收脚本：
+  `tools/setcfg_regression.py`，背景见 `docs/tasks/set_configuration_ep1_wedge.md`。
 
 ## 2. 命令面（PC → FPGA，EP1 OUT）
 
@@ -71,6 +84,70 @@ PC ◀──EP1 IN(4+N words 块)── CH32H417(DMA 透传) ◀──UHSIF L0�
 
 每步等待 ACK：发命令 → 200 ms 内收到任意 ACK 块即成功；超时重发（最多 3 次）；
 重试前若流中出现 ACK 按成功处理（避免命令被重复执行）。
+
+## 2A. 下行批量通道（v2.3，真机验证通过）
+
+FPGA 在命令面之外新增一条 PC→FPGA 的批量数据通道，复用同一 EP1 OUT / UHSIF
+line1；命令与批量块**串行发送**（批量块默认不回 ACK）。
+
+### 批量块格式
+
+| word | 位域 | 说明 |
+|---|---|---|
+| w0 | `{crc16[15:0], 16'hC7F3}` | 同命令块，覆盖 W1..W3 的 CRC-16/CCITT-FALSE |
+| w1 | `{stream_id[7:0], blk_seq[7:0], 8'h30}` | cmd_id=0x30（`0x30..0x3F` 为下行流保留）；blk_seq 每流递增 |
+| w2 | `{29'h0, ack_req, last, 1'b0}` | bit0=last，bit1=ack_req（调试：要求回 ACK），其余保留 0 |
+| w3 | `{20'h0, payload_len[11:0]}` | payload 字数 N，1..4092 |
+| w4.. | payload[N] | 任意数据，LE word 流 |
+
+- 单块最大 `4+4092 = 4096 words = 16 KiB`，正好一个 UHSIF line1 缓冲。
+- **长度约束（v2.3）**：
+  1) payload 长度按**字节 4 字节对齐**；
+  2) **单块 payload 范围 16..16368 字节**（4..4092 words）。实测 16B..16KB 全长度
+     回环逐字校验零错误；带宽随块增大上升（256B≈19MB/s、4KB≈133MB/s、16KB≈176MB/s），
+     小块仅受每块/URB 开销限制，非功能限制；
+  3) **一个批量块 = 一次主机 bulk 写（SS）/一个 512B USB 包（HS）**，即一次 UHSIF
+     line1 传输（不跨传输；跨传输块未实现）。一个主机写入若含多块，H417 传输内块尾
+     靠计数早停会中途撤 RD# 而丢字——务必保持"一块=一次写入"；
+  4) HS 下块 payload 建议 ≤504B（一个 512B USB 包）。
+- FPGA 接收规则：移位窗口同时满足"魔数+CRC+长度>0"即判定为批量块并锁存头部；
+  随后按 N 消费 payload 推入 `rx_stream_*` sink；**CRC 非法的头按非法命令丢弃**
+  （主机必须发 CRC 正确的块，否则可能流失步，用 `blk_seq` 重同步）。
+- 块尾由 AE#/计数终止（`stop_lead` 可调，默认 0 已与真机一致）；单次读有上限
+  与看门狗，绝不读超传输长度。
+- 默认不回 ACK（USB OUT 的固件 NAK 背压保证无损）；`w2.bit1` 或 `0x22 ack_en`
+  可要求回普通 ACK（调试/标定）。
+- **传输粒度约束**：一个批量块 = 一次 UHSIF line1 传输（SS：一次主机 bulk 写；
+  HS：一个 512B USB 包）。大块（≤16KB）实测可用；跨传输块（Mode B）未实现。
+
+### 命令扩展（0x22/0x23，调试/标定）
+
+| cmd_id | 命令 | param | 应答 |
+|---|---|---|---|
+| 0x22 | SET_BULK_CFG | `[0]=ack_en, [3:1]=push_lead, [7:4]=stop_lead, [15:8]=arb_words(预留), [19:16]=rd_cap, [20]=echo_en(回环)` | 普通 ACK |
+| 0x23 | GET_STATS | 索引 0..15 | ACK 的 `w2=value`、`w3[11:0]=index` |
+
+GET_STATS 索引：0=rx_words（含丢弃）、1=rx_blocks、2=rx_dropped、3=rx_err、
+4=rx_last_len、5=rx_sum（投递 payload 字 32 位加和，用于内容校验）、
+6=rx_hdr_cyc（头部检出拍）、7/8=magic/CRC 命中拍数（诊断）、9=上次读停止拍数。
+主机用 `rx_sum` 增量与期望图案加和比对即可验证内容（`tools/uhsif_bulk.c` 已实现）。
+
+### 版本门控
+
+上行块头 `w2[4:0] VER=3` 表示支持批量通道；主机读到 VER<3 必须禁用批量功能。
+`VER=2` 及以前为纯命令面，行为与 v2.2 完全一致。
+
+### 验证状态（2026-09-10/11 真机）
+
+- 全长度 sweep：len=1..4092，`consumed==N`、`blocks=1`、`rx_sum` 一致、err=0；
+  头部检出拍恒为 5（`push_lead=0`）。
+- 回环长度扫频（2026-09-11）：payload 16B..16368B（step 512 + 边界 + 1024 倍数）
+  全部 PASS，`mism=0`、`dropped=0`、`badhdr=0`、`io=0`，块与写入一一对应。
+- 小块回环根因（已修复）：一个批量块拆成多次主机写入时，H417 传输内含多块、块尾
+  靠计数早停（中途撤 RD#）会丢字；改为**一个块 = 一次主机写入**（AE# 收尾）后消除。
+- 持续流：16KB 块 10000 连发（164MB）零错误，约 82–123 MB/s；
+  上下行并发（TEST_MODE 计数流 + 批量下行）双向零错误。
+- 已知限制：单块 ≤16KB；HS 跨传输块未实现；批量块与命令串行，不并发下发。
 
 ## 3. 上行块格式（FPGA → PC，EP1 IN）
 
@@ -158,7 +235,7 @@ EP1 IN 异步读 ─▶ stream 层（块切分/魔数同步/seq 校验）
   按 `payload_len` 前进；头无效或 seq 跳变 ⇒ 重扫描并上报"链路丢包"；
   重同步后连续 ≥2 块无错再确认。
 - 块头字段读取位域：`channel_mask=w1[11:0]`、`speed=w2[17:16]`、`capturing=w2[18]`、
-  `test=w2[19]`、`VER=w2[4:0]`、`seq=w3[31:24]`、`payload_len=w3[11:0]`。
+  `test=w2[19]`、`VER=w2[4:0]`、`seq=w3[31:24]`、`payload_len=w3[23:12]`。
 - 折叠：IN/NAK/SOF 空帧折叠计数（LS/FS 上限 1000、HS 上限 8000）；有错误标志或
   overflow 时先 `stop_folding()` 再落包。
 - DLT 映射：`--speed ls→293、fs→294、hs→295、auto→288`；IDB 按该值写入，

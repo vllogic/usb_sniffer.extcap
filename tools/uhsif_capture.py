@@ -143,7 +143,12 @@ def main():
     dev = find_device()
     if dev is None:
         sys.exit("device 1209:6688 not found")
-    dev.set_configuration()
+    # F1a: 已配置则跳过 set_configuration（重复 SET_CONFIGURATION 会在
+    # 当前固件上锁死 EP1 OUT，见 docs/uhsif_downlink_dev_plan.md）
+    try:
+        dev.get_active_configuration()
+    except usb.core.USBError:
+        dev.set_configuration()
     usb.util.claim_interface(dev, 0)
 
     raw = bytearray()

@@ -135,6 +135,14 @@ static void capture_init_cmds(cmd *c, int speed)
   // flush, so the upstream stream is clean and every ACK resolves promptly.
   struct { int id; u32 param; } init[] =
   {
+    // Upload blocks at the protocol maximum (4092 words / 16 KiB) instead of
+    // the FPGA power-on default of 1024 words (4 KiB).  With 4 KiB blocks the
+    // upstream is throttled by per-block header/inter-block overhead plus a
+    // USBSS TX chain re-arm per block (measured ~91 MB/s on SuperSpeed);
+    // at 16 KiB blocks the same link reaches ~419 MB/s (the FPGA's RESET
+    // command does not reset this register, so the setting survives ENABLE
+    // 1 and the whole capture session).
+    { UHSIF_CMD_UPLOAD_PARAMS, 4092 },
     { UHSIF_CMD_SPEED,  (u32)speed }, // Speed (0=LS 1=FS 2=HS 3=AUTO)
     { UHSIF_CMD_RESET,  0 },          // Reset 0
     { UHSIF_CMD_ENABLE, 1 },          // Enable 1
@@ -147,6 +155,53 @@ static void capture_init_cmds(cmd *c, int speed)
 
     log_print("cmd: 0x%02x(%u) acknowledged", init[i].id, (unsigned)init[i].param);
   }
+}
+
+//-----------------------------------------------------------------------------
+// Startup link-bandwidth probe (gen2, live only): flash UHSIF TEST_MODE so
+// the FPGA counter-fill loads the upstream pipe at the physical link rate,
+// measure the received bytes over a short async window, stop and flush so
+// the real capture starts clean.  The probe traffic never enters the
+// stream/packet pipeline (feed callback is bypassed by the transport).
+//
+// Before measuring, bump the FPGA upload block size to the protocol maximum
+// (CMD_UPLOAD_PARAMS = 4092 words / 16 KiB).  With the default 1024-word
+// (4 KiB) blocks the upstream is throttled by per-block header/inter-block
+// overhead plus a USBSS TX chain re-arm per block (measured ~91 MB/s on
+// SuperSpeed); at 4092 words the same link reaches ~418 MB/s, matching the
+// logic-analyzer project.  Realize the probe reports the physical link's
+// best-case rate, not the 4 KiB-block capture-mode rate.
+//
+// Returns the measured MB/s, or a negative value when the probe is not
+// supported / no bytes were read.
+#define LINK_PROBE_MS   400
+static double capture_speed_probe(cmd *c, transport *tr)
+{
+  // Quiet commands: do not alter the command-layer suppress state, so any
+  // counter-fill bytes the FPGA pushes before the first real command are
+  // still excluded from the upstream pipeline.
+  cmd_tx_quiet(c, UHSIF_CMD_UPLOAD_PARAMS, 4092);  // 16 KiB blocks
+  cmd_tx_quiet(c, UHSIF_CMD_TEST, 1);
+  os_sleep(20);                            // let TEST mode take effect
+
+  s64 bytes = transport_probe_upstream(tr, LINK_PROBE_MS);
+
+  cmd_tx_quiet(c, UHSIF_CMD_TEST, 0);
+  os_sleep(20);
+  transport_discard(tr);                   // drain residual counter-fill blocks
+
+  if (bytes <= 0)
+  {
+    log_print("link probe: no data received, skipped");
+    return -1.0;
+  }
+
+  double mbps = (double)bytes * 1000.0 / (double)LINK_PROBE_MS / 1e6;
+
+  log_print("link probe: %lld bytes over %d ms -> %.1f MB/s",
+            bytes, LINK_PROBE_MS, mbps);
+
+  return mbps;
 }
 
 //-----------------------------------------------------------------------------
@@ -193,11 +248,33 @@ static int run_capture_gen2(const packet_opts *popts)
   // libusb transport reads the ACKs synchronously (no async pool yet) and
   // the replay transport stays in its 16-byte ACK phase.
   capture_stop_and_flush(&cmd, tr);
+
+  // Startup link-bandwidth probe (gen2 live only): flash TEST mode, measure
+  // the achievable uplink rate in ~0.4 s, then restore a stopped/clean state.
+  double link_mbps = -1.0;
+  if (!g_opt.replay)
+    link_mbps = capture_speed_probe(&cmd, tr);
+
   capture_init_cmds(&cmd, popts->capture_speed);
 
   // Now that the FPGA is enabled, lay down the pcapng skeleton and flush any
   // buffered pre-session blocks, then enable the capture gate.
   pcapng_begin(out, dlt_for_speed(popts->capture_speed));
+
+  // Report the measured link bandwidth as the very first record so Wireshark
+  // surfaces it before any packet data.
+  if (link_mbps >= 0.0)
+  {
+    char line[128];
+    int len = snprintf(line, sizeof(line),
+                       "Link bandwidth (uplink): %.1f MB/s", link_mbps);
+    if (len > 0 && len < (int)sizeof(line))
+    {
+      pcapng_write_info(out, 0, line, len);
+      pcapng_flush(out);
+    }
+  }
+
   packet_announce(packet);
 
   transport_stream_mode(tr);
@@ -207,11 +284,24 @@ static int run_capture_gen2(const packet_opts *popts)
   // Main event loop.
   while (!g_stop && transport_alive(tr) && !packet_finished(packet))
   {
-    if (!transport_events(tr, 200))
+    if (!transport_events(tr, 50))
       break;
   }
 
   log_print("capture finished");
+
+  // 会话结束(用户 Stop / 信号 / 抓满)必须显式关闭 FPGA 捕获: 否则 FPGA 保持
+  // capturing=1, 板载 RGB 会持续按速率闪烁, 与 Wireshark 已停止状态不一致。
+  // 用带应答的命令确保真正送达后再关闭传输。
+  if (transport_alive(tr))
+  {
+    if (!cmd_exec(&cmd, UHSIF_CMD_ENABLE, 0))
+      cmd_tx_quiet(&cmd, UHSIF_CMD_ENABLE, 0);   // 退而求其次: 异步补发
+    else
+      log_print("capture disabled (FPGA capturing=0)");
+    os_sleep(20);
+    transport_events(tr, 20);
+  }
 
   pcapng_close(out);
   packet_delete(packet);

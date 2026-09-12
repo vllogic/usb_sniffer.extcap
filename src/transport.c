@@ -40,6 +40,14 @@ bool transport_alive(const transport *t)
 }
 
 //-----------------------------------------------------------------------------
+s64 transport_probe_upstream(transport *t, long window_ms)
+{
+  if (!t->ops->probe_upstream)
+    return -1;
+  return t->ops->probe_upstream(t, window_ms);
+}
+
+//-----------------------------------------------------------------------------
 void transport_close(transport *t)
 {
   if (t)

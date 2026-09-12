@@ -3,7 +3,7 @@
 #include "stream.h"
 #include "uhsif.h"
 
-#define STREAM_BUF_SIZE  262144              // 256 KiB staging buffer
+#define STREAM_BUF_SIZE  1048576            // 1 MiB staging buffer
 #define SCAN_KEEP_TAIL   3                   // keep up to 3 bytes across chunks
 
 enum
@@ -255,21 +255,27 @@ void stream_feed(stream *s, const u8 *data, int size)
 {
   while (size > 0)
   {
-    // Compact first so that every capacity check below uses the plain
-    // "len" accounting; head may be non-zero after process_available()
-    // consumed leading bytes, and mixing head+len into the write bounds is
-    // what allowed an out-of-bounds memcpy at high throughput.
-    if (s->head != 0)
-      compact(s);
-
-    if (s->len + size <= s->cap)
+    // Lazy compaction: only move the unconsumed tail when the append would
+    // actually overflow the buffer.  In the steady state process_available()
+    // consumes whole blocks from the head while remaining data stays behind
+    // it, so appending at head+len avoids a per-feed memmove entirely (the
+    // previous eager compact copied the tail on every feed, which dominated
+    // CPU at >100 MB/s upsteam rates).
+    if (s->head != 0 && s->len + size > s->cap - s->head)
     {
-      memcpy(&s->buf[s->len], data, (size_t)size);
+      memmove(s->buf, &s->buf[s->head], (size_t)s->len);
+      s->head = 0;
+    }
+
+    if (s->len + size <= s->cap - s->head)
+    {
+      memcpy(&s->buf[s->head + s->len], data, (size_t)size);
       s->len += size;
       break;
     }
 
     // Buffer full: copy as much as fits and process it, then continue.
+    compact(s);
     int room = s->cap - s->len;
     int part = os_min(size, room);
 

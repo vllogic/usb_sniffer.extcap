@@ -27,9 +27,9 @@ import sys
 
 UHSIF_BLK_MAGIC16 = 0x6CC6      # w0[15:0] of an FPGA->PC block header
 ACK_SEQ_START = 0
-DATA_SEQ_START = 5          # 5 ACKs precede the data phase
-CMD_WORDS = 1024            # max_payload_dwords default (4096 bytes)
-ACK_COUNT = 5
+DATA_SEQ_START = 6          # 6 ACKs precede the data phase
+CMD_WORDS = 4092            # max_payload_dwords set by the plugin (16 KiB blocks)
+ACK_COUNT = 6
 CHANNEL_MASK = 1
 CAPTURING = 1
 

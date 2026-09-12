@@ -96,8 +96,14 @@ all: $(BIN)
 $(BIN): $(SRCS) $(HDRS)
 	gcc $(CFLAGS) $(SRCS) -o $(BIN) $(LDFLAGS)
 
+# --- UHSIF bulk-downlink bring-up / calibration tool (not part of the plugin) ---
+#   make tools/uhsif_bulk
+tools/uhsif_bulk: tools/uhsif_bulk.c src/uhsif.h
+	gcc $(CFLAGS) tools/uhsif_bulk.c -o $@ $(LDFLAGS) -pthread
+
 clean:
 	rm -f $(BIN)
+	rm -f tools/uhsif_bulk tools/uhsif_bulk.exe
 	rm -rf test
 
 # --- Offline regression suite ----------------------------------------------
