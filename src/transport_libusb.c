@@ -176,26 +176,25 @@ static void tl_submit_in_pool(transport *t)
 }
 
 //-----------------------------------------------------------------------------
-static bool tl_open(transport *t)
+// Scan for the gen2 device handle and claim interface 0.  Polls for up to 5 s
+// so a caller right after a device soft reset (0xE2) survives the brief
+// re-enumeration gap.  Returns false when the device never showed up or the
+// interface could not be claimed; the caller decides whether that is fatal.
+static bool tl_open_handle(libusb_priv *p)
 {
-  libusb_priv *p = (libusb_priv *)t->priv;
-  int rc = libusb_init(NULL);
-
-  if (rc < 0)
-    os_error("libusb_init(): %s", libusb_error_name(rc));
-
   libusb_device_handle *handle = NULL;
+  int rc;
 
-  // Retry-bounded scan: the previous session ends with a device soft reset
-  // (0xE2), so a session started right after may hit the re-enumeration
-  // gap (the device briefly disappears from the bus).  Poll for up to 5 s.
   for (int attempt = 0; attempt < 50 && !handle; attempt++)
   {
     libusb_device **devices = NULL;
 
     int count = libusb_get_device_list(NULL, &devices);
     if (count < 0)
-      os_error("libusb_get_device_list(): %s", libusb_error_name(count));
+    {
+      log_print("libusb_get_device_list(): %s", libusb_error_name(count));
+      return false;
+    }
 
     for (int i = 0; i < count; i++)
     {
@@ -220,23 +219,143 @@ static bool tl_open(transport *t)
   }
 
   if (!handle)
-  {
-    libusb_exit(NULL);
-    os_error("could not open the capture device (VID %04x:PID %04x)", USB_VID, USB_PID);
-  }
+    return false;
 
   p->handle = handle;
-
   p->cmd_buf = os_alloc(SYNC_BUF_SIZE);
 
   libusb_set_auto_detach_kernel_driver(handle, 1);
   rc = libusb_claim_interface(handle, 0);
   if (rc < 0)
-    os_error("libusb_claim_interface(): %s", libusb_error_name(rc));
+  {
+    log_print("usb: libusb_claim_interface(): %s", libusb_error_name(rc));
+    if (p->cmd_buf) { os_free(p->cmd_buf); p->cmd_buf = NULL; }
+    libusb_close(handle);
+    p->handle = NULL;
+    return false;
+  }
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Cancel and free every in-flight IN/OUT transfer and buffer, without touching
+// the handle.  Sets closing so in_callback() does not resubmit during teardown.
+static void tl_teardown_io(libusb_priv *p)
+{
+  p->closing = true;
+
+  for (int i = 0; i < OUT_POOL_SIZE; i++)
+  {
+    if (p->out_pool[i].transfer && p->out_pool[i].busy)
+      libusb_cancel_transfer(p->out_pool[i].transfer);
+  }
+
+  for (int i = 0; i < TRANSFER_COUNT; i++)
+  {
+    if (p->in_transfers[i])
+      libusb_cancel_transfer(p->in_transfers[i]);
+  }
+
+  // Drain the event loop until every cancelled transfer ran its callback;
+  // otherwise the following free races the callback thread.
+  for (int spin = 0; spin < 50; spin++)
+  {
+    struct timeval tv = { 0, 10000 };
+    libusb_handle_events_timeout(NULL, &tv);
+  }
+
+  for (int i = 0; i < TRANSFER_COUNT; i++)
+  {
+    if (p->in_transfers[i])
+    {
+      libusb_free_transfer(p->in_transfers[i]);
+      os_free(p->in_buffers[i]);
+      p->in_transfers[i] = NULL;
+      p->in_buffers[i] = NULL;
+    }
+  }
+
+  for (int i = 0; i < OUT_POOL_SIZE; i++)
+  {
+    if (p->out_pool[i].transfer)
+    {
+      libusb_free_transfer(p->out_pool[i].transfer);
+      p->out_pool[i].transfer = NULL;
+    }
+    p->out_pool[i].busy = false;
+  }
+
+  if (p->cmd_buf)
+  {
+    os_free(p->cmd_buf);
+    p->cmd_buf = NULL;
+  }
+
+  p->streams_up = false;
+}
+
+//-----------------------------------------------------------------------------
+static bool tl_open(transport *t)
+{
+  libusb_priv *p = (libusb_priv *)t->priv;
+  int rc = libusb_init(NULL);
+
+  if (rc < 0)
+    os_error("libusb_init(): %s", libusb_error_name(rc));
+
+  if (!tl_open_handle(p))
+  {
+    libusb_exit(NULL);
+    os_error("could not open the capture device (VID %04x:PID %04x)", USB_VID, USB_PID);
+  }
 
   p->alive = true;
 
   log_print("usb: device opened (EP1 IN/OUT)");
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+// Recovery for a wedged EP1 (first command no-ACK, seen on Windows after a
+// boot).  Sends the vendor 0xE2 soft reset (same request as the session-end
+// reset / iap_cli.py reset), tears the transport down and re-opens it.  Only
+// valid during the command phase, before stream_mode() starts the async pool.
+static bool tl_reset_device(transport *t)
+{
+  libusb_priv *p = (libusb_priv *)t->priv;
+
+  if (!p->handle || p->streams_up)
+    return false;
+
+  int rc = libusb_control_transfer(p->handle,
+      LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE,
+      0xE2, 0/*delay ms*/, 0/*wIndex*/, NULL, 0, 200);
+
+  if (rc < 0)
+    log_print("usb: reset request failed: %s", libusb_error_name(rc));
+
+  // The reset may drop and re-enumerate the device (Windows).  Release and
+  // re-open so the retry talks to a freshly configured handle.
+  tl_teardown_io(p);
+  libusb_release_interface(p->handle, 0);
+  libusb_close(p->handle);
+  p->handle = NULL;
+  p->closing = false;
+  p->alive = false;
+
+  os_sleep(500);
+
+  if (!tl_open_handle(p))
+  {
+    log_print("usb: device did not come back after reset");
+    return false;
+  }
+
+  p->alive = true;
+
+  log_print("usb: device reset and re-opened");
 
   return true;
 }
@@ -540,50 +659,9 @@ static void tl_close(transport *t)
     if (rc < 0)
       log_print("usb: session-end reset request failed: %s", libusb_error_name(rc));
 
-    p->closing = true;   // in_callback() must not resubmit during teardown
-
-    // OUT pool: a command issued right before teardown may still be in
-    // flight.  libusb requires cancellation before free; the shared drain
-    // loop below lets out_callback() run and release the slot.  Cancel
-    // errors are ignored: after the session-end reset above the device may
-    // already be re-enumerating (NOT_FOUND / NO_DEVICE), in which case the
-    // transfer is either already complete or gone with the bus.
-    for (int i = 0; i < OUT_POOL_SIZE; i++)
-    {
-      if (p->out_pool[i].transfer && p->out_pool[i].busy)
-        libusb_cancel_transfer(p->out_pool[i].transfer);
-    }
-
-    for (int i = 0; i < TRANSFER_COUNT; i++)
-    {
-      if (p->in_transfers[i])
-        libusb_cancel_transfer(p->in_transfers[i]);
-    }
-
-    // Drain the event loop until every cancelled transfer ran its callback;
-    // otherwise libusb_exit() below races the callback thread (mutex assert).
-    for (int spin = 0; spin < 50; spin++)
-    {
-      struct timeval tv = { 0, 10000 };
-      libusb_handle_events_timeout(NULL, &tv);
-    }
-
-    for (int i = 0; i < TRANSFER_COUNT; i++)
-    {
-      if (p->in_transfers[i])
-      {
-        libusb_free_transfer(p->in_transfers[i]);
-        os_free(p->in_buffers[i]);
-      }
-    }
-
-    for (int i = 0; i < OUT_POOL_SIZE; i++)
-    {
-      if (p->out_pool[i].transfer)
-        libusb_free_transfer(p->out_pool[i].transfer);
-    }
-
-    os_free(p->cmd_buf);
+    // Cancel/free the pools and buffers, then drop the handle.  tl_teardown_io()
+    // sets closing so in_callback() cannot resubmit during cancellation.
+    tl_teardown_io(p);
 
     libusb_release_interface(p->handle, 0);
     libusb_close(p->handle);
@@ -607,6 +685,7 @@ transport *transport_libusb_new(const transport_callbacks *cb)
     .alive = tl_alive,
     .close = tl_close,
     .probe_upstream = tl_probe_upstream,
+    .reset_device = tl_reset_device,
   };
 
   t->cb = *cb;

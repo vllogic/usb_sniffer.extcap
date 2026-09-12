@@ -48,6 +48,14 @@ s64 transport_probe_upstream(transport *t, long window_ms)
 }
 
 //-----------------------------------------------------------------------------
+bool transport_reset_device(transport *t)
+{
+  if (!t->ops->reset_device)
+    return false;
+  return t->ops->reset_device(t);
+}
+
+//-----------------------------------------------------------------------------
 void transport_close(transport *t)
 {
   if (t)

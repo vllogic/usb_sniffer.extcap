@@ -41,6 +41,11 @@ typedef struct
   // window_ms (with an internal async pool, bypassing the feed callback) and
   // return the number of bytes received, or -1 when not supported (replay).
   s64  (*probe_upstream)(transport *t, long window_ms);
+  // Optional recovery for a wedged EP1 (first command never acknowledged):
+  // soft-reset the device and re-open it so the command can be retried.
+  // Returns true when the transport is ready again; NULL when unsupported
+  // (replay backend) or only valid during the pre-stream startup phase.
+  bool (*reset_device)(transport *t);
 } transport_ops;
 
 // libusb: open/claim the device (VID 0x1209 / PID 0x6688).  The EP1 IN async
@@ -80,6 +85,13 @@ bool transport_alive(const transport *t);
 // Returns -1 when the transport does not support probing (replay backend):
 // callers must skip the probe and the bandwidth announcement in that case.
 s64 transport_probe_upstream(transport *t, long window_ms);
+
+// Recovery hook for a wedged EP1 discovered by a first-command timeout (seen
+// on Windows right after a boot: EP1 IN never answers).  Soft-resets the
+// device (vendor request 0xE2) and re-opens the transport so the caller can
+// retry the command sequence once.  Returns false when the backend does not
+// support it (replay) or the device did not come back.
+bool transport_reset_device(transport *t);
 
 void transport_close(transport *t);
 

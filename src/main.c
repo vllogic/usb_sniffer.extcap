@@ -127,7 +127,10 @@ static void capture_stop_and_flush(cmd *c, transport *tr)
 }
 
 //-----------------------------------------------------------------------------
-static void capture_init_cmds(cmd *c, int speed)
+// Send the acknowledged FPGA init sequence.  Returns false on the first
+// command that is never acknowledged, so the caller can recover (device reset)
+// and retry once instead of aborting outright.
+static bool capture_init_cmds(cmd *c, int speed)
 {
   // Serialized init sequence mirroring the upstream plugin, mapped onto the
   // UHSIF command set.  The FPGA acknowledges every command with a 16-byte
@@ -151,10 +154,15 @@ static void capture_init_cmds(cmd *c, int speed)
   for (unsigned i = 0; i < ARRAY_SIZE(init); i++)
   {
     if (!cmd_exec(c, init[i].id, init[i].param))
-      os_error("FPGA did not acknowledge command 0x%02x, aborting", init[i].id);
+    {
+      log_print("cmd: 0x%02x(%u) no ACK", init[i].id, (unsigned)init[i].param);
+      return false;
+    }
 
     log_print("cmd: 0x%02x(%u) acknowledged", init[i].id, (unsigned)init[i].param);
   }
+
+  return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -247,15 +255,40 @@ static int run_capture_gen2(const packet_opts *popts)
   // before the acknowledged init sequence.  During the command phase the
   // libusb transport reads the ACKs synchronously (no async pool yet) and
   // the replay transport stays in its 16-byte ACK phase.
-  capture_stop_and_flush(&cmd, tr);
-
-  // Startup link-bandwidth probe (gen2 live only): flash TEST mode, measure
-  // the achievable uplink rate in ~0.4 s, then restore a stopped/clean state.
+  //
+  // Recovery: on Windows right after a boot EP1 IN can come up wedged (the
+  // first command never answers; see docs/tasks/set_configuration_ep1_wedge.md).
+  // When the init sequence fails, soft-reset the device once and retry the
+  // whole startup instead of aborting the capture.
   double link_mbps = -1.0;
-  if (!g_opt.replay)
-    link_mbps = capture_speed_probe(&cmd, tr);
+  bool inited = false;
 
-  capture_init_cmds(&cmd, popts->capture_speed);
+  for (int attempt = 0; attempt < 2 && !inited; attempt++)
+  {
+    capture_stop_and_flush(&cmd, tr);
+
+    // Startup link-bandwidth probe (gen2 live only): flash TEST mode, measure
+    // the achievable uplink rate in ~0.4 s, then restore a stopped/clean state.
+    link_mbps = -1.0;
+    if (!g_opt.replay)
+      link_mbps = capture_speed_probe(&cmd, tr);
+
+    inited = capture_init_cmds(&cmd, popts->capture_speed);
+
+    if (!inited && attempt == 0)
+    {
+      log_print("startup: FPGA not responding, resetting device once");
+
+      if (!transport_reset_device(tr))
+        os_error("FPGA not responding and device reset is unavailable");
+
+      cmd_init(&cmd, tr);        // seq/suppress/fatal after the device reboot
+      os_sleep(200);
+    }
+  }
+
+  if (!inited)
+    os_error("FPGA did not acknowledge the init sequence after device reset");
 
   // Now that the FPGA is enabled, lay down the pcapng skeleton and flush any
   // buffered pre-session blocks, then enable the capture gate.
