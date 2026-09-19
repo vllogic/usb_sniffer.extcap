@@ -48,4 +48,11 @@ bool packet_finished(const packet *p);
 
 void packet_delete(packet *p);
 
+// Emit a final syslog/interface-1 record explaining why the capture ended
+// (host stop / uplink lost / capture limit / stream end).
+void packet_stop_info(packet *p, const char *reason);
+
+// Emit a plain syslog/interface-1 record (used e.g. for the build fingerprint).
+void packet_info(packet *p, const char *msg);
+
 #endif // PACKET_H

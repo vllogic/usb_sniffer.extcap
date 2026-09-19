@@ -31,6 +31,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
 
 // Windows (MSYS2/MinGW): the CRT defaults stdout/stderr to text mode, which
 // converts '\n' to "\r\n" and corrupts the extcap protocol stream (paths,
@@ -72,18 +75,152 @@ static int dlt_for_speed(int speed)
 }
 
 //-----------------------------------------------------------------------------
+// Decouple the USB event loop from the interpretation/pcapng pipeline.
+//
+// The transport callback used to run stream_feed()->packet_feed()->pcapng_write
+// inline.  A live consumer (Wireshark) can stall for tens/hundreds of ms while
+// it dissects or redraws; the pcapng ring then fills and pcapng_write blocks
+// inside the libusb callback, which stops reaping/re-submitting URBs.  The
+// device has only ~2.25 MiB of SRAM (~50 ms), so it overflows -> truncated
+// frames -> the desync/toggle storm.  Writing to a plain file from the CLI
+// never stalls, which is exactly why the same capture was clean there.
+//
+// Fix: the callback only memcpy()s into a raw-byte queue and returns
+// immediately; a worker thread drains it through stream/packet/pcapng.
+// Consumer stalls now back up this queue, not the URB servicing.
+//
+// Sizing is a latency <-> burst-tolerance trade-off: 32 x 256 KiB = 8 MiB here
+// plus 8 MiB in pcapng = 16 MiB total.  That is ~0.35 s at 46 MB/s (still
+// >6x the device's own 2.25 MiB/~50 ms elasticity), but unlike the first cut
+// (64 MiB raw + 16 MiB pcapng) it does not make the Wireshark event stream lag
+// ~1.7 s or drop a large in-flight tail when the user hits Stop right after a
+// read.  A persistent consumer slower than the bus will still build a backlog
+// up to this bound -- that is physical and cannot be buffered away.
+#define RAWQ_CHUNK (256 * 1024)
+#define RAWQ_SLOTS 32
+
+typedef struct { u8 *buf; int len; } rawq_item;
+
+typedef struct
+{
+  pthread_mutex_t mu;
+  pthread_cond_t  nonempty, nonfull;
+  rawq_item       q[RAWQ_SLOTS];
+  int             head, tail, count;
+  u8             *free_bufs[RAWQ_SLOTS];
+  int             free_count;
+  int             stop;
+  stream         *stream;
+  pthread_t       tid;
+} rawq;
+
+static void *rawq_thread(void *arg)
+{
+  rawq *r = (rawq *)arg;
+
+  for (;;)
+  {
+    pthread_mutex_lock(&r->mu);
+    while (0 == r->count && 0 == r->stop)
+      pthread_cond_wait(&r->nonempty, &r->mu);
+    if (0 == r->count && r->stop) { pthread_mutex_unlock(&r->mu); break; }
+
+    rawq_item it = r->q[r->tail];
+    r->tail = (r->tail + 1) % RAWQ_SLOTS;
+    r->count--;
+    pthread_cond_signal(&r->nonfull);
+    pthread_mutex_unlock(&r->mu);
+
+    stream_feed(r->stream, it.buf, it.len);
+
+    pthread_mutex_lock(&r->mu);
+    r->free_bufs[r->free_count++] = it.buf;
+    pthread_mutex_unlock(&r->mu);
+  }
+  return NULL;
+}
+
+static bool rawq_init(rawq *r, stream *s)
+{
+  memset(r, 0, sizeof(*r));
+  r->stream = s;
+  pthread_mutex_init(&r->mu, NULL);
+  pthread_cond_init(&r->nonempty, NULL);
+  pthread_cond_init(&r->nonfull, NULL);
+  for (int i = 0; i < RAWQ_SLOTS; i++)
+  {
+    r->free_bufs[i] = (u8 *)os_alloc(RAWQ_CHUNK);
+    if (!r->free_bufs[i]) return false;
+  }
+  r->free_count = RAWQ_SLOTS;
+  return pthread_create(&r->tid, NULL, rawq_thread, r) == 0;
+}
+
+static void rawq_push(rawq *r, const u8 *data, int size)
+{
+  int off = 0;
+
+  while (off < size)
+  {
+    int n = size - off;
+    if (n > RAWQ_CHUNK) n = RAWQ_CHUNK;
+
+    pthread_mutex_lock(&r->mu);
+    while (0 == r->free_count && 0 == r->stop)
+      pthread_cond_wait(&r->nonfull, &r->mu);
+    if (r->stop || 0 == r->free_count) { pthread_mutex_unlock(&r->mu); return; }
+    u8 *b = r->free_bufs[--r->free_count];
+    pthread_mutex_unlock(&r->mu);
+
+    memcpy(b, data + off, (size_t)n);
+
+    pthread_mutex_lock(&r->mu);
+    r->q[r->head].buf = b;
+    r->q[r->head].len = n;
+    r->head = (r->head + 1) % RAWQ_SLOTS;
+    r->count++;
+    pthread_cond_signal(&r->nonempty);
+    pthread_mutex_unlock(&r->mu);
+    off += n;
+  }
+}
+
+static void rawq_stop(rawq *r)
+{
+  pthread_mutex_lock(&r->mu);
+  r->stop = 1;
+  pthread_cond_broadcast(&r->nonempty);
+  pthread_cond_broadcast(&r->nonfull);
+  pthread_mutex_unlock(&r->mu);
+  pthread_join(r->tid, NULL);
+  for (int i = 0; i < r->free_count; i++)
+    free(r->free_bufs[i]);
+}
+
+//-----------------------------------------------------------------------------
 // Device-side callbacks (all run in the transport event loop).
 typedef struct
 {
   stream *stream;
   cmd    *cmd;
   packet *packet;
+  rawq   *rq;
+  int     async_feed;      // only the live data phase is decoupled; the
+                           // acknowledged command phases need synchronous
+                           // parse (cmd_exec() waits for the ACK callback)
 } context;
 
 static void feed_cb(void *user, const u8 *data, int size)
 {
   context *cx = (context *)user;
-  stream_feed(cx->stream, data, size);
+
+  if (size <= 0)
+    return;
+
+  if (cx->async_feed)
+    rawq_push(cx->rq, data, size);
+  else
+    stream_feed(cx->stream, data, size);
 }
 
 static void data_cb(void *user, const u8 *data, int size)
@@ -92,6 +229,11 @@ static void data_cb(void *user, const u8 *data, int size)
 
   if (!cmd_input_suppressed(cx->cmd))
     packet_feed(cx->packet, data, size);
+
+  // Parsing now runs on the raw-queue worker thread; wake the main loop if the
+  // capture limit (or a fatal stream end) was reached there.
+  if (packet_finished(cx->packet))
+    g_stop = 1;
 }
 
 static void ack_cb(void *user)
@@ -237,6 +379,14 @@ static int run_capture_gen2(const packet_opts *popts)
   cx.cmd = &cmd;
   cx.packet = packet;
 
+  rawq rq;
+  cx.rq = &rq;
+  if (!rawq_init(&rq, stream))
+  {
+    log_print("raw queue init failed");
+    return 1;
+  }
+
   tcb.feed = feed_cb;
   tcb.feed_user = &cx;
 
@@ -308,20 +458,70 @@ static int run_capture_gen2(const packet_opts *popts)
     }
   }
 
+  // Research §11.17: the device's stall elasticity (~2.25 MiB pool + FIFOs
+  // ≈ 50 ms @46 MB/s) and the 16-deep IN pool only pay off when the uplink
+  // really runs in 16 KiB-block mode on SuperSpeed (~420 MB/s).  Two degraded
+  // modes silently destroy that margin:
+  //   * UPLOAD_PARAMS did not take effect -> 4 KiB blocks -> ~91-95 MB/s
+  //     (each URB then short-terminates at 4 KiB, so the deep pool is useless);
+  //   * the device enumerated on the USB2 half of the hub (480 Mbps, shared
+  //     with the tapped bus) -> ~40-50 MB/s.
+  // In both cases the host only has the pool's own ~50 ms, so surface it.
+  if (link_mbps >= 0.0 && link_mbps < 150.0)
+  {
+    char warn[192];
+    int len = snprintf(warn, sizeof(warn),
+                       "WARNING: uplink degraded (%.1f MB/s < 150); expected ~420 MB/s "
+                       "with 16 KiB blocks on SuperSpeed -- host stalls may drop packets",
+                       link_mbps);
+    if (len > 0 && len < (int)sizeof(warn))
+    {
+      log_print("%s", warn);
+      pcapng_write_info(out, 0, warn, len);
+      pcapng_flush(out);
+    }
+  }
+
   packet_announce(packet);
 
+  // Build fingerprint: makes it obvious which binary Wireshark actually
+  // loaded (the plugin must be copied into %APPDATA%\Wireshark\extcap\ and
+  // Wireshark restarted; a stale copy silently keeps running otherwise).
+  packet_info(packet, "Plugin build: " __DATE__ " " __TIME__);
+
   transport_stream_mode(tr);
+  cx.async_feed = 1;          // data phase: decouple parse/pcapng from USB
 
   log_print("capture running");
 
   // Main event loop.
-  while (!g_stop && transport_alive(tr) && !packet_finished(packet))
+  while (!g_stop && transport_alive(tr) && !packet_finished(packet)
+         && !pcapng_write_failed(out))
   {
     if (!transport_events(tr, 50))
       break;
   }
 
   log_print("capture finished");
+
+  // Drain the raw queue and stop its worker before touching the transport
+  // again: the session-end commands below need synchronous ACK parsing.
+  rawq_stop(&rq);
+  cx.async_feed = 0;
+
+  // Record WHY the capture ended into the pcapng (if1).  "It stopped by
+  // itself" must never be a mystery again: this distinguishes a host stop
+  // (Wireshark Stop / stop-condition / signal), a lost uplink, the capture
+  // limit, and a stream end.  packet_finished is checked before g_stop because
+  // data_cb() also raises g_stop to wake this loop when the limit is reached,
+  // which would otherwise mislabel a limit stop as a host stop.
+  const char *why = packet_finished(packet) ? "capture limit reached"
+                  : g_stop                  ? "host stop (Wireshark Stop / stop condition / signal)"
+                  : pcapng_write_failed(out) ? "output pipe closed (consumer stopped reading)"
+                  : !transport_alive(tr)     ? "uplink/device lost"
+                  : "stream ended";
+  log_print("capture finished: %s", why);
+  packet_stop_info(packet, why);
 
   // 会话结束(用户 Stop / 信号 / 抓满)必须显式关闭 FPGA 捕获: 否则 FPGA 保持
   // capturing=1, 板载 RGB 会持续按速率闪烁, 与 Wireshark 已停止状态不一致。

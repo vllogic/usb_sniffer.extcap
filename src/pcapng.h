@@ -35,4 +35,9 @@ void pcapng_flush(pcapng *p);
 
 void pcapng_close(pcapng *p);
 
+// True once the writer thread hit a write error (e.g. the consumer closed the
+// output pipe).  Wireshark Stop on Windows is a hard TerminateProcess, but if
+// it merely closes the pipe this lets the capture loop stop promptly.
+bool pcapng_write_failed(const pcapng *p);
+
 #endif // PCAPNG_H

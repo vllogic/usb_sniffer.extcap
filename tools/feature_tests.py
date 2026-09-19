@@ -160,6 +160,26 @@ def check(name, cond, detail=''):
         raise AssertionError(name)
 
 
+def epb_timestamps(out):
+    data = open(out, 'rb').read()
+    off, n, res = 0, len(data), []
+    while off + 12 <= n:
+        btype, blen = struct.unpack_from('<II', data, off)
+        if blen < 12 or off + blen > n:
+            break
+        if btype == 6:
+            tsh, tsl = struct.unpack_from('<II', data, off + 12)
+            res.append((tsh << 32) | tsl)
+        off += blen
+    return res
+
+
+def check_monotonic(name, out):
+    ts = epb_timestamps(out)
+    bad = sum(1 for a, b in zip(ts, ts[1:]) if b < a)
+    check(name + ' (EPB timestamps monotonic)', bad == 0, f'{bad} backwards steps')
+
+
 def infos(epbs):
     return ''.join(x[1][14:].decode('latin1') for x in epbs.get(1, []))
 
@@ -186,6 +206,7 @@ def test_folding():
     data0 = [x[1] for x in epbs.get(0, [])]
     expected = [b'\xa5\x00\x01', b'\x69\x00\x01', b'\x5a', b'\xc3\x00\x11\x22'] * 3
     check('folding: folded batch flushed in order', data0 == expected, str(len(data0)))
+    check_monotonic('folding', out)
 
     # Scenario 2: a run of SOFs collapses (each SOF resets the fold buffer);
     # the flush messages carries the run length.
@@ -293,6 +314,7 @@ def test_fold_survives_timeout():
     info = infos(epbs)
     check('fold: limit batch "Folded 1000 empty frames" 2x', info.count('Folded 1000 empty frames') == 2, info)
     check('fold: tail batch "Folded 199 empty frames"', 'Folded 199 empty frames' in info, info)
+    check_monotonic('fold timeout', out)
     check('fold: no "Periodic update" while folding', 'Periodic update' not in info, info)
 
 
@@ -327,6 +349,70 @@ def test_capture_limit():
     data0 = epbs.get(0, [])
     check('limit: only 3 frames captured', len(data0) == 3, f'{len(data0)} frames')
     check('limit: "Capture limit reached" reported', 'Capture limit reached' in infos(epbs), infos(epbs))
+
+
+def test_fold_not_broken_by_info():
+    """Regression: frequent INFO records (line-state changes) must NOT abort a
+    fold run.  capture_info() used to call stop_folding(), so on live HS traffic
+    (line-state/Periodic records arrive constantly) folds collapsed to a few
+    frames instead of the 1000/8000 limit and the EPB rate exploded.  Interleave
+    a line-state change before every SOF and require one full 1000-frame batch."""
+    c = CapBuilder()
+    c.status(1000, ls=0, speed=1)               # FS, line state SE0
+    t = 2000
+    for i in range(1200):
+        c.status(t, ls=(1 if (i & 1) else 0), speed=1)   # -> "Line state" info record
+        t += 1000
+        c.data(t, b'\xa5\x00\x01')                     # SOF (foldable)
+        t += 1000
+    c.data(t, b'\xc3\x01\x02\x03')                   # non-foldable -> flush tail
+
+    out = os.path.join(WORK, 'fold_info.pcapng')
+    run(['--speed', 'fs', '--fold'], wrap(c), out)
+    _, epbs = collect(out)
+    info = infos(epbs)
+    check('fold: info records do not break folding (1000-frame batch)',
+          'Folded 1000 empty frames' in info, info[:200])
+
+
+def test_fold_parse_equivalence():
+    """Regression: --fold is output-only and must NOT change the frame
+    parser's diagnostics.  Feed the identical malformed stream (foldable
+    SOF/IN/NAK run, then a wrong-toggle frame and an invalid-size header) with
+    and without --fold; the error records must be byte-identical.  Also guards
+    the negative-capture_size crash: an invalid size must resync, not be
+    passed on as a huge length."""
+    c = CapBuilder()
+    for i in range(8):
+        c.data(1000 + i, b'\xa5\x01\x02')       # SOF  (starts a fold run)
+    for i in range(12):
+        c.data(2000 + i, b'\x69\x00')             # IN   (foldable)
+    for i in range(12):
+        c.data(3000 + i, b'\x5a')                  # NAK  (foldable)
+    c.b += data_frame(4000, 1, b'\x69\x00')       # wrong toggle
+    c.data(5000, b'\x69\x00')
+    ts20 = 6000 & 0xFFFFF
+    c.b += bytes([0x80 | (0x40 if (c.gidx & 1) else 0) | (ts20 >> 16),
+                  (ts20 >> 8) & 0xFF, ts20 & 0xFF, 0, 5, 0, 0])   # invalid size 5
+    c.gidx += 1
+    for i in range(5):
+        c.data(7000 + i, b'\x69\x00')
+    stream = wrap(c)
+
+    def errors(out):
+        _, epbs = collect(out)
+        return [pay[14:].decode('latin1') for _, pay in epbs.get(1, [])
+                if pay[14:].decode('latin1').startswith(('Error', 'Packet header'))]
+
+    res = {}
+    for mode, arg in (('fold', ['--fold']), ('nofold', [])):
+        out = os.path.join(WORK, 'fold_parse_' + mode + '.pcapng')
+        run(['--speed', 'fs'] + arg, stream, out)
+        res[mode] = errors(out)
+
+    check('fold: parse errors identical with/without --fold',
+          len(res['fold']) > 0 and res['fold'] == res['nofold'],
+          f"fold={res['fold']} nofold={res['nofold']}")
 
 
 def test_stream_resync():
@@ -387,6 +473,8 @@ def main():
         test_trigger_falling,
         test_capture_limit,
         test_stream_resync,
+        test_fold_parse_equivalence,
+        test_fold_not_broken_by_info,
     ]
     for t in tests:
         t()

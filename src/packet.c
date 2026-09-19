@@ -100,6 +100,24 @@ static void keepalive_event(packet *p, u64 ts, int delta);
 static void stop_folding(packet *p);
 
 //-----------------------------------------------------------------------------
+// Speed used to interpret frames.  The status frame carries the FPGA speed
+// *detector's* opinion (usb_capture.v drives it from speed_detect_o).  That
+// detector can stick to Low-Speed -- it treats sustained K idle as LS and never
+// re-validates that lock -- so an FS bus whose SOF packets decode perfectly may
+// still be reported as LS.  The FPGA decodes with the operator-selected speed
+// (speed_w = configured when manual), so a detected LS must not override an
+// explicit FS/HS selection: without this, allow_sof became false and fold
+// silently did nothing.  AUTO still uses the detected value as before.
+static int effective_speed(const packet *p)
+{
+  if (CaptureSpeed_LS == p->capture_speed_in &&
+      CaptureSpeed_Reset != p->opts.capture_speed &&
+      CaptureSpeed_LS != p->opts.capture_speed)
+    return p->opts.capture_speed;
+  return p->capture_speed_in;
+}
+
+//-----------------------------------------------------------------------------
 static void capture_info(packet *p, u64 ts, const char *fmt, ...)
 {
   char str[512];
@@ -119,12 +137,22 @@ static void capture_info(packet *p, u64 ts, const char *fmt, ...)
     len = (int)sizeof(str) - 1;
 
   line_state_event(p);
-  stop_folding(p);
 
+  // NOTE: do NOT stop_folding() here.  Info records go to the syslog interface
+  // (if1) while folded empty frames go to the USB interface (if0), so there is
+  // no ordering requirement between them.  Flushing on every info record made
+  // the fold batches collapse to a few frames whenever a line-state / trigger /
+  // VBUS / speed / Periodic-update record arrived -- on live HS traffic those
+  // are frequent, so folding compressed almost nothing and the EPB rate (and
+  // Wireshark's backlog) exploded.  The ordering that does matter (folded empty
+  // frames before a following non-empty data frame) is already enforced in
+  // data_event(), which calls stop_folding() before writing such a frame.
   pcapng_write_info(p->out, ts, str, len);
   p->capture_last_ts = ts;
 
-  pcapng_flush(p->out);
+  // No pcapng_flush() here.  This runs for every line-state/error/Folded
+  // record; forcing a synchronous drain made the consumer (Wireshark) able to
+  // stall the callback on every record.  The writer thread drains normally.
 }
 
 //-----------------------------------------------------------------------------
@@ -174,11 +202,11 @@ static void line_state_event(packet *p)
   }
   else if (dp == 0)
   {
-    strcat(str, (CaptureSpeed_LS == p->capture_speed_in) ? "J" : "K");
+    strcat(str, (CaptureSpeed_LS == effective_speed(p)) ? "J" : "K");
   }
   else if (dm == 0)
   {
-    strcat(str, (CaptureSpeed_LS == p->capture_speed_in) ? "K" : "J");
+    strcat(str, (CaptureSpeed_LS == effective_speed(p)) ? "K" : "J");
   }
   else
   {
@@ -261,7 +289,7 @@ static void status_event(packet *p, int ls, int vbus, int trigger, int speed)
 
     p->capture_ls = ls;
 
-    if (CaptureSpeed_LS == p->capture_speed_in && LS_SE0 == p->capture_saved_ls && LS_J3 == ls &&
+    if (CaptureSpeed_LS == effective_speed(p) && LS_SE0 == p->capture_saved_ls && LS_J3 == ls &&
         (MIN_KEEPALIVE_DURATION < (int)delta && (int)delta < MAX_KEEPALIVE_DURATION))
     {
       p->capture_saved_ls = LS_INVALID;
@@ -290,18 +318,32 @@ static void stop_folding(packet *p)
   p->capture_fold_count = 0;
   p->capture_fold_buf_ptr = 0;
 
+  // Emit the buffered frames FIRST, and never let their (older) capture
+  // timestamp go backwards relative to what was already written: folding
+  // batches empty frames and flushes them after newer frames, which produced
+  // non-monotonic EPB timestamps (measured: 34-75 backwards steps per folded
+  // capture, up to 17.5 ms; non-folded output was always monotonic).  Wireshark
+  // flags such captures.  Folded frames are empty/keep-alive markers whose
+  // exact time is not meaningful, so clamping them to the last written ts is
+  // the right trade-off.
+  for (int i = 0; i < ptr; i++)
+  {
+    u64 ts = p->capture_fold_buf[i].ts;
+    if (ts < p->capture_last_ts)
+      ts = p->capture_last_ts;
+
+    if (p->capture_fold_buf[i].size < 0)
+      write_keepalive(p, ts);
+    else
+      write_packet(p, ts, p->capture_fold_buf[i].data, p->capture_fold_buf[i].size);
+  }
+
+  // Summary record goes after the frames it describes (its ts is the current
+  // one, so the file order stays monotonic).
   if (count == 1)
     capture_info(p, p->capture_ts, "Folded empty frame");
   else if (count > 1)
     capture_info(p, p->capture_ts, "Folded %d empty frames", count);
-
-  for (int i = 0; i < ptr; i++)
-  {
-    if (p->capture_fold_buf[i].size < 0)
-      write_keepalive(p, p->capture_fold_buf[i].ts);
-    else
-      write_packet(p, p->capture_fold_buf[i].ts, p->capture_fold_buf[i].data, p->capture_fold_buf[i].size);
-  }
 }
 
 //-----------------------------------------------------------------------------
@@ -365,7 +407,7 @@ static void keepalive_event(packet *p, u64 ts, int delta)
 static void data_event(packet *p)
 {
   bool data_error = p->capture_crc_error || p->capture_data_error;
-  bool allow_sof  = (CaptureSpeed_LS != p->capture_speed_in);
+  bool allow_sof  = (CaptureSpeed_LS != effective_speed(p));
   int  pid = p->capture_data[0];
 
   if (!p->capture_enabled)
@@ -397,7 +439,7 @@ static void data_event(packet *p)
       p->capture_fold_count++;
       p->capture_fold_buf_ptr = 0;
 
-      if (p->capture_fold_count == ((CaptureSpeed_HS == p->capture_speed_in) ? FOLD_LIMIT_HS : FOLD_LIMIT_LS_FS))
+      if (p->capture_fold_count == ((CaptureSpeed_HS == effective_speed(p)) ? FOLD_LIMIT_HS : FOLD_LIMIT_LS_FS))
         stop_folding(p);
 
       fold_packet(p, p->capture_ts, p->capture_data, p->capture_size);
@@ -525,7 +567,16 @@ static inline void capture_sm(packet *p, u8 byte)
     {
       int size = (((int)p->capture_data[3] & 0x7) << 8) | p->capture_data[4];
 
-      check_data_size(p, size);
+      // An invalid size (seen from the FPGA during speed-re-detect glitches)
+      // must only be reported + resynced: continuing would set a negative
+      // capture_size and later hand it to write_packet()/pcapng_write_epb()
+      // as a huge unsigned length (crash).  desync_error() already reset the
+      // frame state, so just stop assembling this frame.
+      if (size < DATA_HEADER_SIZE || size > MAX_DATA_SIZE)
+      {
+        check_data_size(p, size);
+        return;
+      }
 
       p->capture_size = size - DATA_HEADER_SIZE;
       p->capture_overflow = (p->capture_data[3] & HEADER_OVERFLOW) ? true : false;
@@ -627,6 +678,16 @@ void packet_rsync(packet *p)
 }
 
 //-----------------------------------------------------------------------------
+void packet_info(packet *p, const char *msg)
+{
+  capture_info(p, p->capture_ts, "%s", msg);
+}
+
+void packet_stop_info(packet *p, const char *reason)
+{
+  capture_info(p, p->capture_ts, "Capture stopped: %s", reason);
+}
+
 bool packet_finished(const packet *p)
 {
   return p->done;

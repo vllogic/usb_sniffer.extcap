@@ -19,12 +19,32 @@
 
 #define EP_IN            0x81
 #define EP_OUT           0x01
-// 主机侧 IN 传输池: 16 x 256KiB (总 4MiB)。实测在 Windows 独立抓取(读 32MB)
-// 下 overflow 最低(118, 相比旧 8x256KB 的 174), 且内存仅 4MiB; 参考实现的
-// 32x16MiB(512MiB) 并无更好表现。Linux 同样适用(低于 usbfs_memory_mb 16MB)。
+// 主机侧 IN 传输池: 16 x 256KiB (总 4MiB)。Linux 低于 usbfs_memory_mb 默认 16MB 上限。
+//
+// 池深度必须与**上传块大小**一起看（见报告 §11.17 的注入停顿实测）：
+//   * 采集前我们已把 FPGA 上传块设为 4092 字 = 16 KiB（main.c capture_init_cmds）。
+//     此时每个 URB 实际要收满约 230 KiB 才完成（实测 avg≈230KB、短包率 ~46%），
+//     所以 16 个 URB ≈ 3.7 MiB 真实在途缓冲。
+//   * 实测（usbcap_fast, --blk-dwords 4092, 单流 ~46MB/s, 注入一次主机停顿）:
+//       8  URB: 100ms 停顿 -> 丢 ~2.0 MB
+//       16 URB: 100ms 停顿 -> 0 丢（200ms -> 4.7MB）
+//       32 URB: 100ms -> 0 丢（200ms -> 1.1MB, 300ms -> 4.6MB）
+//     ⇒ 16 路把设备可承受的主机停顿从 ~50ms(仅设备弹性) 提升到 ~100-150ms，
+//       而 256KiB 的块大小/完成率完全不变（xferN 与 8 路一致）。
+//   * **前提是 16 KiB 上传块**：若上传块回落到 FPGA 默认 1024 字(4 KiB)，每个 URB
+//     在 4 KiB 就被短包终结，"在途 4 MiB"实际只有 16x4 KiB，此时深池反而更差
+//     （实测 32 路严重退化）。因此 main.c 在链路探测速率异常时会告警——见那里。
+//   * >=512 KiB 单笔仍会灾难性丢包（§11.11），不要加大单笔尺寸。
 #define TRANSFER_SIZE    (256 * 1024)           // 256 KiB per IN transfer
 #define TRANSFER_COUNT   16
-#define TRANSFER_TIMEOUT 1000                   // ms
+#define TRANSFER_TIMEOUT 0                      // ms; 0 = 无限（不 cancel）
+// 说明: 数据池的 IN 传输**不能用有限超时**。libusb 超时会 cancel 该 URB，设备侧为这个
+// URB 排队的在途数据随之被丢弃/停顿，进而让上游(FPGA 采集 FIFO)回压溢出——表现为
+// `overflow` 事件与零星丢包。实测(usbcap_fast，同负载同工具、唯一变量=超时)：
+//   timeout=500ms -> records=3255691 crcEv=36 ovfEv=43 derrEv=39
+//   timeout=0     -> records=2970280 crcEv=0  ovfEv=0  derrEv=0
+// 命令阶段(未启动数据池时)仍用其有限超时同步读 ACK，与这里无关；teardown 由
+// tl_close() 的 cancel 处理。
 
 // 同步读/命令/探测缓冲上限: 不可沿用 16MiB 的异步池长度做同步
 // libusb_bulk_transfer(), Windows 下会崩溃/极不稳定。
@@ -61,6 +81,7 @@ typedef struct
   libusb_device_handle *handle;
   struct libusb_transfer *in_transfers[TRANSFER_COUNT];
   u8                    *in_buffers[TRANSFER_COUNT];
+  u8                    *spare;        // 回调内 swap 用：先提交再解析，不让慢消费者排空池
   out_slot              out_pool[OUT_POOL_SIZE];
   u8                    *cmd_buf;      // command-phase sync read buffer
   bool                  alive;
@@ -93,12 +114,7 @@ static void LIBUSB_CALL in_callback(struct libusb_transfer *transfer)
   if (p->closing)
     return;
 
-  if (transfer->status == LIBUSB_TRANSFER_COMPLETED)
-  {
-    if (transfer->actual_length > 0 && t->cb.feed)
-      t->cb.feed(t->cb.feed_user, transfer->buffer, transfer->actual_length);
-  }
-  else if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
+  if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE)
   {
     log_print("usb: device disconnected");
     p->alive = false;
@@ -113,6 +129,43 @@ static void LIBUSB_CALL in_callback(struct libusb_transfer *transfer)
   {
     log_print("usb: EP1 IN transfer error, retrying");
   }
+
+  // 顺序很重要：**先**用备用缓冲把这一笔换下来并立刻重新提交，**再**解析/落盘。
+  // 否则"解析 + 写 pcapng（可能因 Wireshark/管道变慢而阻塞）"期间整个传输池会排空，
+  // 回压顶到设备侧就产生 overflow 丢包——与"有限超时 cancel URB"是同一类主机侧原因。
+  // 回调是串行的，因此单个备用缓冲足够（用完在本回调末尾归还）。
+  {
+    unsigned len = transfer->actual_length;
+    u8 *mine = transfer->buffer;
+
+    if (p->spare != NULL && len < TRANSFER_SIZE)
+    {
+      transfer->buffer = p->spare;     // 换给驱动继续收
+      p->spare        = mine;          // 这笔数据归我们解析
+      rc = libusb_submit_transfer(transfer);
+      if (rc < 0)
+      {
+        log_print("usb: libusb_submit_transfer() failed: %s", libusb_error_name(rc));
+        p->alive = false;
+        transfer->buffer = mine;       // 归还，保持指针一致
+        p->spare = NULL;
+        return;
+      }
+
+      // Deliver whatever arrived for **every** terminal status, not only
+      // COMPLETED: libusb reports the bytes received before a timeout (or a
+      // babble/overflow) in actual_length, and those bytes are silently lost
+      // if this branch is skipped.
+      if (len > 0 && t->cb.feed)
+        t->cb.feed(t->cb.feed_user, mine, len);
+
+      p->spare = mine;                 // 解析完归还备用（回调串行，无竞争）
+      return;
+    }
+  }
+
+  if (transfer->actual_length > 0 && t->cb.feed)
+    t->cb.feed(t->cb.feed_user, transfer->buffer, transfer->actual_length);
 
   rc = libusb_submit_transfer(transfer);
   if (rc < 0)
@@ -136,6 +189,7 @@ static void tl_submit_in_pool(transport *t)
   for (int i = 0; i < TRANSFER_COUNT; i++)
   {
     p->in_buffers[i] = os_alloc(TRANSFER_SIZE);
+    if (i == 0 && !p->spare) p->spare = os_alloc(TRANSFER_SIZE);   // 单个备用即可：回调串行
     p->in_transfers[i] = libusb_alloc_transfer(0);
 
     if (!p->in_buffers[i] || !p->in_transfers[i])

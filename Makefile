@@ -94,7 +94,7 @@ endif
 all: $(BIN)
 
 $(BIN): $(SRCS) $(HDRS)
-	gcc $(CFLAGS) $(SRCS) -o $(BIN) $(LDFLAGS)
+	gcc $(CFLAGS) $(SRCS) -o $(BIN) $(LDFLAGS) -pthread
 
 # --- UHSIF bulk-downlink bring-up / calibration tool (not part of the plugin) ---
 #   make tools/uhsif_bulk
